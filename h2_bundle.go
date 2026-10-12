@@ -3627,6 +3627,10 @@ func (s http2Setting) Valid() error {
 		if s.Val != 1 && s.Val != 0 {
 			return http2ConnectionError(http2ErrCodeProtocol)
 		}
+	case http2SettingNoRFC7540Priorities:
+		if s.Val != 1 && s.Val != 0 {
+			return http2ConnectionError(http2ErrCodeProtocol)
+		}
 	}
 	return nil
 }
@@ -3643,6 +3647,7 @@ const (
 	http2SettingMaxFrameSize          http2SettingID = 0x5
 	http2SettingMaxHeaderListSize     http2SettingID = 0x6
 	http2SettingEnableConnectProtocol http2SettingID = 0x8
+	http2SettingNoRFC7540Priorities   http2SettingID = 0x9
 )
 
 var http2settingName = map[http2SettingID]string{
@@ -3653,6 +3658,7 @@ var http2settingName = map[http2SettingID]string{
 	http2SettingMaxFrameSize:          "MAX_FRAME_SIZE",
 	http2SettingMaxHeaderListSize:     "MAX_HEADER_LIST_SIZE",
 	http2SettingEnableConnectProtocol: "ENABLE_CONNECT_PROTOCOL",
+	http2SettingNoRFC7540Priorities:   "NO_RFC7540_PRIORITIES",
 }
 
 func (s http2SettingID) String() string {
@@ -4656,6 +4662,21 @@ type http2serverConn struct {
 	shutdownOnce sync.Once
 }
 
+// writeSchedIgnoresRFC7540 reports whether the connection's write scheduler
+// disregards RFC 7540 priorities, as every scheduler but the RFC 7540 one does.
+func (sc *http2serverConn) writeSchedIgnoresRFC7540() bool {
+	switch sc.writeSched.(type) {
+	case *http2priorityWriteSchedulerRFC9218:
+		return true
+	case *http2randomWriteScheduler:
+		return true
+	case *http2roundRobinWriteScheduler:
+		return true
+	default:
+		return false
+	}
+}
+
 func (sc *http2serverConn) maxHeaderListSize() uint32 {
 	n := sc.hs.MaxHeaderBytes
 	if n <= 0 {
@@ -4946,6 +4967,12 @@ func (sc *http2serverConn) serve(conf http2http2Config) {
 	}
 	if !http2disableExtendedConnectProtocol {
 		settings = append(settings, http2Setting{http2SettingEnableConnectProtocol, 1})
+	}
+	// As golang.org/x/net/http2 (and so Caddy) does: announce RFC 9218's
+	// SETTINGS_NO_RFC7540_PRIORITIES last unless the write scheduler acts on
+	// RFC 7540 priorities. Thanks to Kinkan (GetsuNoKaze/kinkan) for the patch.
+	if sc.writeSchedIgnoresRFC7540() {
+		settings = append(settings, http2Setting{http2SettingNoRFC7540Priorities, 1})
 	}
 	sc.writeFrame(http2FrameWriteRequest{
 		write: settings,
