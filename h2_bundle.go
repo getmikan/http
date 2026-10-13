@@ -1472,6 +1472,10 @@ var (
 // flow control window update.
 const http2inflowMinRefresh = 4 << 10
 
+// inflowRefreshDivisor: a window update is held back until it is at least
+// 1/inflowRefreshDivisor of the window (or doubles the peer's available window).
+const http2inflowRefreshDivisor = 8
+
 // inflow accounts for an inbound flow control window.
 // It tracks both the latest window sent to the peer (used for enforcement)
 // and the accumulated unsent window.
@@ -1504,14 +1508,34 @@ func (f *http2inflow) add(n int) (connAdd int32) {
 		panic("flow control update exceeds maximum window size")
 	}
 	f.unsent = int32(unsent)
-	if f.unsent < http2inflowMinRefresh && f.unsent < f.avail {
+	if f.unsent < f.avail && (f.unsent < http2inflowMinRefresh || int64(f.unsent)*http2inflowRefreshDivisor < int64(f.avail)+int64(f.unsent)) {
 		// If there aren't at least inflowMinRefresh bytes of window to send,
 		// and this update won't at least double the window, buffer the update for later.
+		//
+		// Citrus: also buffer it until it is at least 1/inflowRefreshDivisor
+		// of the window (avail+unsent). Upstream sends a WINDOW_UPDATE (one
+		// for the connection, one for the stream, and a flush: a TLS record
+		// and a write syscall) every 4 KiB read, which for a reader of 32 KiB
+		// chunks is one per Read; with the default 1 MiB windows this sends
+		// one per 128 KiB. The peer always keeps at least 7/8 of the window
+		// it would have had, so the throughput is not limited by it.
 		return 0
 	}
 	f.avail += f.unsent
 	f.unsent = 0
 	return int32(unsent)
+}
+
+// takeUnsent returns the accumulated unsent window, to be sent now, if it is
+// at least inflowMinRefresh, and 0 otherwise.
+func (f *http2inflow) takeUnsent() int32 {
+	if f.unsent < http2inflowMinRefresh {
+		return 0
+	}
+	n := f.unsent
+	f.avail += n
+	f.unsent = 0
+	return n
 }
 
 // take attempts to take n bytes from the peer's flow control window.
@@ -3748,10 +3772,17 @@ func http2newBufferedWriter(conn net.Conn, timeout time.Duration) *http2buffered
 // bufWriterPoolBufferSize is the size of bufio.Writer's
 // buffers created using bufWriterPool.
 //
-// TODO: pick a less arbitrary value? this is a bit under
-// (3 x typical 1500 byte MTU) at least. Other than that,
-// not much thought went into it.
-const http2bufWriterPoolBufferSize = 4 << 10
+// Citrus: 64 KiB instead of upstream's 4 KiB. A frame that fits in what is
+// left of the buffer is written synchronously by the serve goroutine (see
+// startFrameWrite and staysWithinBuffer), and the buffer is flushed once the
+// write queue drains. With 4 KiB every full DATA frame (16 KiB + a 9-byte
+// header) took the asynchronous path: a goroutine per frame, and a pass-through
+// write that the TLS layer split into a 16 KiB record and a 9-byte record, two
+// write syscalls per frame. With 64 KiB, consecutive DATA frames (several
+// streams, or a handler write split by SETTINGS_MAX_FRAME_SIZE) are coalesced
+// into one write of full TLS records. The buffer is taken from the pool only
+// while bytes are buffered, so idle connections hold none.
+const http2bufWriterPoolBufferSize = 64 << 10
 
 var http2bufWriterPool = sync.Pool{
 	New: func() interface{} {
@@ -6537,11 +6568,34 @@ func (sc *http2serverConn) noteBodyReadFromHandler(st *http2stream, n int, err e
 
 func (sc *http2serverConn) noteBodyRead(st *http2stream, n int) {
 	sc.serveG.check()
-	sc.sendWindowUpdate(nil, n) // conn-level
-	if st.state != http2stateHalfClosedRemote && st.state != http2stateClosed {
-		// Don't send this WINDOW_UPDATE if the stream is closed
-		// remotely.
-		sc.sendWindowUpdate(st, n)
+	// Don't send the stream's WINDOW_UPDATE if the stream is closed remotely.
+	streamOpen := st.state != http2stateHalfClosedRemote && st.state != http2stateClosed
+	connSend := sc.inflow.add(n)
+	var streamSend int32
+	if streamOpen {
+		streamSend = st.inflow.add(n)
+	}
+	// Citrus: when one of the two updates is due, send the other one with it
+	// if it has at least inflowMinRefresh pending, so both go out in the same
+	// flush (one TLS record and one write) instead of two flushes later.
+	if connSend != 0 || streamSend != 0 {
+		if connSend == 0 {
+			connSend = sc.inflow.takeUnsent()
+		}
+		if streamOpen && streamSend == 0 {
+			streamSend = st.inflow.takeUnsent()
+		}
+	}
+	if connSend != 0 {
+		sc.writeFrame(http2FrameWriteRequest{
+			write: http2writeWindowUpdate{streamID: 0, n: uint32(connSend)},
+		})
+	}
+	if streamSend != 0 {
+		sc.writeFrame(http2FrameWriteRequest{
+			write:  http2writeWindowUpdate{streamID: st.id, n: uint32(streamSend)},
+			stream: st,
+		})
 	}
 }
 
@@ -9932,6 +9986,16 @@ func (b http2transportResponseBody) Read(p []byte) (n int, err error) {
 	var streamAdd int32
 	if err == nil { // No need to refresh if the stream is over or failed.
 		streamAdd = cs.inflow.add(n)
+	}
+	// Citrus: send both updates in the same flush when one of them is due
+	// (see serverConn.noteBodyRead).
+	if connAdd != 0 || streamAdd != 0 {
+		if connAdd == 0 {
+			connAdd = cc.inflow.takeUnsent()
+		}
+		if err == nil && streamAdd == 0 {
+			streamAdd = cs.inflow.takeUnsent()
+		}
 	}
 	cc.mu.Unlock()
 
