@@ -2094,6 +2094,14 @@ func testReverseProxyQueryParameterSmuggling(t *testing.T, wantCleanQuery bool, 
 		rawQuery:   strings.Repeat("a=1&", 10000) + "a=1",
 		cleanQuery: "",
 	}} {
+		if wantCleanQuery && strings.Count(test.rawQuery, "&") >= 10000 && !urlLimitsQueryParams() {
+			// This fork's go.mod says go 1.20, so Go >= 1.24 runs it with
+			// GODEBUG=urlmaxqueryparams=0, and Go < 1.24 has no limit at
+			// all. Without the limit net/url parses every parameter, the
+			// proxy re-encodes all of them, and nothing is smuggled past
+			// the hook: the expectation only holds when the limit is on.
+			continue
+		}
 		res, err := frontend.Client().Get(frontend.URL + "?" + test.rawQuery)
 		if err != nil {
 			t.Fatalf("Get: %v", err)
@@ -2108,6 +2116,13 @@ func testReverseProxyQueryParameterSmuggling(t *testing.T, wantCleanQuery bool, 
 			t.Errorf("proxy forwarded raw query %q as %q, want %q", test.rawQuery, got, want)
 		}
 	}
+}
+
+// urlLimitsQueryParams reports whether net/url rejects queries with more than
+// 10000 parameters in this build (see testReverseProxyQueryParameterSmuggling).
+func urlLimitsQueryParams() bool {
+	_, err := url.ParseQuery(strings.Repeat("a=1&", 10000) + "a=1")
+	return err != nil
 }
 
 // Issue #72954: We should not call WriteHeader on a ResponseWriter after hijacking
